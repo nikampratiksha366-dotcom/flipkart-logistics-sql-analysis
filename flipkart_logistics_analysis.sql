@@ -1,6 +1,14 @@
 -- =========================================================
 -- FLIPKART LOGISTICS SQL ANALYSIS
 -- Database: MySQL 8.0+
+-- ---------------------------------------------------------
+-- Improvements applied:
+-- 1. Safe reruns (DROP IF EXISTS)
+-- 2. Raw + cleaned staging separation
+-- 3. Data quality checks
+-- 4. Indexes for performance
+-- 5. Transaction safety
+-- 6. Reusable views and robust KPI logic
 -- =========================================================
 
 CREATE DATABASE IF NOT EXISTS flipkart_project;
@@ -10,9 +18,35 @@ USE flipkart_project;
 SET SQL_SAFE_UPDATES = 0;
 
 -- =========================================================
--- CREATE TABLES
+-- PREPARE RAW DATA TABLE
 -- =========================================================
 
+-- Keep the original imported data untouched for repeatable analysis.
+CREATE TABLE IF NOT EXISTS orders_raw (
+    Order_ID               VARCHAR(20),
+    Customer_ID            VARCHAR(20),
+    Warehouse_ID           VARCHAR(20),
+    Route_ID               VARCHAR(20),
+    Agent_ID               VARCHAR(20),
+    Order_Date             DATE,
+    Expected_Delivery_Date DATE,
+    Actual_Delivery_Date   DATE,
+    Traffic_Delay_Min      INT,
+    Order_Value            DECIMAL(10,2),
+    Delivery_Status        VARCHAR(50),
+    Date_Flag              VARCHAR(20)
+);
+
+-- If you are loading raw data from CSV, import it here into orders_raw.
+-- Example (MySQL):
+-- LOAD DATA INFILE '/path/to/flipkart_orders.csv'
+-- INTO TABLE orders_raw
+-- FIELDS TERMINATED BY ','
+-- ENCLOSED BY '"'
+-- LINES TERMINATED BY '\n'
+-- IGNORE 1 LINES;
+
+-- Create cleaned table from raw records.
 CREATE TABLE IF NOT EXISTS orders (
     Order_ID               VARCHAR(20),
     Customer_ID            VARCHAR(20),
@@ -30,7 +64,6 @@ CREATE TABLE IF NOT EXISTS orders (
 
 -- Task 6 needs shipment tracking data. These columns were NOT in the
 -- orders table, so they live in a separate table (one row per order).
--- Load your tracking data into this table before running Task 6.
 CREATE TABLE IF NOT EXISTS shipment_tracking (
     Order_ID            VARCHAR(20),
     Last_Checkpoint     VARCHAR(100),
@@ -39,17 +72,37 @@ CREATE TABLE IF NOT EXISTS shipment_tracking (
     Delayed_Checkpoints INT
 );
 
--- Load data (Table Data Import Wizard or LOAD DATA INFILE) at this point.
+-- Load your tracking data into this table before running Task 6.
+-- Example (MySQL):
+-- LOAD DATA INFILE '/path/to/shipment_tracking.csv'
+-- INTO TABLE shipment_tracking
+-- FIELDS TERMINATED BY ','
+-- ENCLOSED BY '"'
+-- LINES TERMINATED BY '\n'
+-- IGNORE 1 LINES;
 
-DESC orders;
+-- =========================================================
+-- DATA QUALITY CHECKS
+-- =========================================================
+
+SELECT
+    'orders_raw' AS table_name,
+    COUNT(*) AS total_rows,
+    COUNT(DISTINCT Order_ID) AS distinct_order_ids,
+    SUM(CASE WHEN Order_ID IS NULL THEN 1 ELSE 0 END) AS null_order_ids,
+    SUM(CASE WHEN Order_Date IS NULL THEN 1 ELSE 0 END) AS null_order_dates,
+    SUM(CASE WHEN Expected_Delivery_Date IS NULL THEN 1 ELSE 0 END) AS null_expected_dates,
+    SUM(CASE WHEN Actual_Delivery_Date IS NULL THEN 1 ELSE 0 END) AS null_actual_dates
+FROM orders_raw;
 
 -- =========================================================
 -- TASK 1 : DATA CLEANING
 -- =========================================================
 
--- 1a. Remove duplicate Order_IDs (keep exactly ONE row per Order_ID).
--- The original DELETE ... WHERE Order_ID IN (rn > 1) removed every copy,
--- including the one to keep. Rebuild the table instead.
+START TRANSACTION;
+
+-- 1a. Remove duplicate Order_IDs, keeping only one row per Order_ID.
+DROP TABLE IF EXISTS orders_dedup;
 CREATE TABLE orders_dedup AS
 SELECT Order_ID, Customer_ID, Warehouse_ID, Route_ID, Agent_ID,
        Order_Date, Expected_Delivery_Date, Actual_Delivery_Date,
@@ -58,21 +111,22 @@ FROM (
     SELECT o.*,
            ROW_NUMBER() OVER (
                PARTITION BY Order_ID
-               ORDER BY Order_Date
+               ORDER BY Order_Date, Expected_Delivery_Date, Actual_Delivery_Date
            ) AS rn
-    FROM orders o
+    FROM orders_raw o
 ) t
 WHERE rn = 1;
 
-DROP TABLE orders;
+DROP TABLE IF EXISTS orders;
 RENAME TABLE orders_dedup TO orders;
 
 ALTER TABLE orders ADD PRIMARY KEY (Order_ID);
 
--- 1b. Replace NULL Traffic_Delay_Min with the route average
+-- 1b. Fill missing Traffic_Delay_Min using route-wise average.
 UPDATE orders o
 JOIN (
-    SELECT Route_ID, ROUND(AVG(Traffic_Delay_Min)) AS Avg_Delay
+    SELECT Route_ID,
+           ROUND(AVG(Traffic_Delay_Min), 0) AS Avg_Delay
     FROM orders
     WHERE Traffic_Delay_Min IS NOT NULL
     GROUP BY Route_ID
@@ -80,27 +134,24 @@ JOIN (
 SET o.Traffic_Delay_Min = r.Avg_Delay
 WHERE o.Traffic_Delay_Min IS NULL;
 
--- Fallback: routes where every value was NULL get the overall average
+-- Fallback for routes where all delays are NULL.
 UPDATE orders
 SET Traffic_Delay_Min = (
-    SELECT avg_all FROM (
-        SELECT ROUND(AVG(Traffic_Delay_Min)) AS avg_all FROM orders
+    SELECT avg_all
+    FROM (
+        SELECT ROUND(AVG(Traffic_Delay_Min), 0) AS avg_all
+        FROM orders
     ) x
 )
 WHERE Traffic_Delay_Min IS NULL;
 
--- 1c. Date format check.
--- DATE columns are already stored as YYYY-MM-DD. If the raw file was
--- imported as text (e.g. 15-03-2024), convert it first with:
---   UPDATE orders SET Order_Date = STR_TO_DATE(Order_Date, '%d-%m-%Y');
-SELECT
-    DATE_FORMAT(Order_Date, '%Y-%m-%d')             AS Formatted_Order_Date,
-    DATE_FORMAT(Expected_Delivery_Date, '%Y-%m-%d') AS Formatted_Expected_Date,
-    DATE_FORMAT(Actual_Delivery_Date, '%Y-%m-%d')   AS Formatted_Actual_Date
-FROM orders
-LIMIT 20;
+-- 1c. Convert textual date formats if imported incorrectly.
+-- Example conversion for raw files like '15-03-2024':
+-- UPDATE orders SET Order_Date = STR_TO_DATE(Order_Date, '%d-%m-%Y');
+-- UPDATE orders SET Expected_Delivery_Date = STR_TO_DATE(Expected_Delivery_Date, '%d-%m-%Y');
+-- UPDATE orders SET Actual_Delivery_Date = STR_TO_DATE(Actual_Delivery_Date, '%d-%m-%Y');
 
--- 1d. Flag invalid dates (single pass, also catches NULL dates)
+-- 1d. Flag invalid dates.
 UPDATE orders
 SET Date_Flag = CASE
     WHEN Order_Date IS NULL
@@ -112,22 +163,49 @@ SET Date_Flag = CASE
     ELSE 'VALID'
 END;
 
+COMMIT;
+
 SELECT Date_Flag, COUNT(*) AS Total_Orders
 FROM orders
 GROUP BY Date_Flag;
 
--- Analysis view: valid rows only, with reusable calculated columns.
---   Delivery_Days = Actual - Order date   (total delivery time)
---   Delay_Days    = Actual - Expected     (negative = early, positive = late)
+-- =========================================================
+-- CREATE ANALYSIS VIEWS
+-- =========================================================
+
+DROP VIEW IF EXISTS valid_orders;
 CREATE OR REPLACE VIEW valid_orders AS
 SELECT
     o.*,
     DATEDIFF(Actual_Delivery_Date, Order_Date)             AS Delivery_Days,
     DATEDIFF(Actual_Delivery_Date, Expected_Delivery_Date) AS Delay_Days,
-    CASE WHEN Actual_Delivery_Date > Expected_Delivery_Date
-         THEN 1 ELSE 0 END                                 AS Is_Delayed
+    CASE WHEN Actual_Delivery_Date > Expected_Delivery_Date THEN 1 ELSE 0 END AS Is_Delayed
 FROM orders o
 WHERE Date_Flag = 'VALID';
+
+-- Additional reusable view for shipment tracking data.
+DROP VIEW IF EXISTS shipment_summary;
+CREATE OR REPLACE VIEW shipment_summary AS
+SELECT
+    Order_ID,
+    Last_Checkpoint,
+    Checkpoint_Time,
+    Delay_Reason,
+    Delayed_Checkpoints,
+    CASE WHEN Delayed_Checkpoints > 2 THEN 1 ELSE 0 END AS Is_Major_Delay
+FROM shipment_tracking;
+
+-- =========================================================
+-- INDEXES FOR PERFORMANCE
+-- =========================================================
+
+CREATE INDEX IF NOT EXISTS idx_orders_route_id ON orders(Route_ID);
+CREATE INDEX IF NOT EXISTS idx_orders_warehouse_id ON orders(Warehouse_ID);
+CREATE INDEX IF NOT EXISTS idx_orders_agent_id ON orders(Agent_ID);
+CREATE INDEX IF NOT EXISTS idx_orders_order_date ON orders(Order_Date);
+CREATE INDEX IF NOT EXISTS idx_orders_delivery_status ON orders(Delivery_Status);
+CREATE INDEX IF NOT EXISTS idx_tracking_order_id ON shipment_tracking(Order_ID);
+CREATE INDEX IF NOT EXISTS idx_tracking_delay_reason ON shipment_tracking(Delay_Reason);
 
 -- =========================================================
 -- TASK 2 : DELIVERY DELAY ANALYSIS
@@ -168,8 +246,8 @@ FROM valid_orders;
 
 -- Average delivery time and traffic delay per route
 SELECT Route_ID,
-       ROUND(AVG(Delivery_Days), 2)      AS Avg_Delivery_Time_Days,
-       ROUND(AVG(Traffic_Delay_Min), 2)  AS Avg_Traffic_Delay_Min
+       ROUND(AVG(Delivery_Days), 2)     AS Avg_Delivery_Time_Days,
+       ROUND(AVG(Traffic_Delay_Min), 2) AS Avg_Traffic_Delay_Min
 FROM valid_orders
 GROUP BY Route_ID;
 
@@ -187,18 +265,18 @@ SELECT Route_ID,
        ROUND(AVG(Order_Value) / NULLIF(AVG(Delivery_Days), 0), 2) AS Efficiency_Ratio
 FROM valid_orders
 GROUP BY Route_ID
-HAVING Efficiency_Ratio IS NOT NULL
+HAVING AVG(Order_Value) / NULLIF(AVG(Delivery_Days), 0) IS NOT NULL
 ORDER BY Efficiency_Ratio ASC
 LIMIT 3;
 
 -- Routes with more than 20% delayed shipments
 SELECT Route_ID,
-       COUNT(*)                          AS Total_Orders,
-       SUM(Is_Delayed)                   AS Delayed_Orders,
-       ROUND(AVG(Is_Delayed) * 100, 2)   AS Delay_Percentage
+       COUNT(*)                        AS Total_Orders,
+       SUM(Is_Delayed)                 AS Delayed_Orders,
+       ROUND(AVG(Is_Delayed) * 100, 2) AS Delay_Percentage
 FROM valid_orders
 GROUP BY Route_ID
-HAVING Delay_Percentage > 20
+HAVING ROUND(AVG(Is_Delayed) * 100, 2) > 20
 ORDER BY Delay_Percentage DESC;
 
 -- RECOMMENDATION:
@@ -283,7 +361,7 @@ SELECT Agent_ID, Route_ID,
        ROUND((1 - AVG(Is_Delayed)) * 100, 2) AS On_Time_Percentage
 FROM valid_orders
 GROUP BY Agent_ID, Route_ID
-HAVING On_Time_Percentage < 80
+HAVING ROUND((1 - AVG(Is_Delayed)) * 100, 2) < 80
 ORDER BY On_Time_Percentage ASC;
 
 -- Average delivery time: top 5 (fastest) vs bottom 5 (slowest) agents
@@ -294,7 +372,7 @@ WITH Agent_Speed AS (
 ),
 Ranked AS (
     SELECT Agent_ID, Avg_Delivery_Time,
-           ROW_NUMBER() OVER (ORDER BY Avg_Delivery_Time ASC,  Agent_ID) AS fastest_rank,
+           ROW_NUMBER() OVER (ORDER BY Avg_Delivery_Time ASC, Agent_ID) AS fastest_rank,
            ROW_NUMBER() OVER (ORDER BY Avg_Delivery_Time DESC, Agent_ID) AS slowest_rank
     FROM Agent_Speed
 )
@@ -367,3 +445,16 @@ FROM orders
 GROUP BY Route_ID
 ORDER BY Total_Revenue ASC
 LIMIT 1;
+
+-- =========================================================
+-- OPTIONAL: FINAL KPI SUMMARY
+-- =========================================================
+
+SELECT
+    COUNT(*) AS Total_Orders,
+    SUM(CASE WHEN Date_Flag = 'VALID' THEN 1 ELSE 0 END) AS Valid_Orders,
+    SUM(CASE WHEN Date_Flag = 'INVALID' THEN 1 ELSE 0 END) AS Invalid_Orders,
+    ROUND(AVG(CASE WHEN Date_Flag = 'VALID' THEN DATEDIFF(Actual_Delivery_Date, Order_Date) END), 2) AS Avg_Delivery_Days,
+    ROUND(SUM(CASE WHEN Actual_Delivery_Date > Expected_Delivery_Date THEN Order_Value ELSE 0 END), 2) AS Late_Delivery_Revenue,
+    ROUND(SUM(Order_Value), 2) AS Total_Revenue
+FROM orders;
