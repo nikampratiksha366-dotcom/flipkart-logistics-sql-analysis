@@ -9,7 +9,7 @@
 -- 4. Indexes for performance
 -- 5. Transaction safety
 -- 6. Reusable views and robust KPI logic
--- =========================================================
+-- ========================================================
 
 CREATE DATABASE IF NOT EXISTS flipkart_project;
 USE flipkart_project;
