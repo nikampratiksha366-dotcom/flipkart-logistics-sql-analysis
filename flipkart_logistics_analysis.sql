@@ -96,7 +96,7 @@ SELECT
 FROM orders_raw;
 
 -- =========================================================
--- TASK 1 : DATA CLEANING
+-- TASK 1: DATA CLEANING
 -- =========================================================
 
 START TRANSACTION;
@@ -208,7 +208,7 @@ CREATE INDEX IF NOT EXISTS idx_tracking_order_id ON shipment_tracking(Order_ID);
 CREATE INDEX IF NOT EXISTS idx_tracking_delay_reason ON shipment_tracking(Delay_Reason);
 
 -- =========================================================
--- TASK 2 : DELIVERY DELAY ANALYSIS
+-- TASK 2: DELIVERY DELAY ANALYSIS
 -- =========================================================
 
 -- Delay per order (Delay_Days > 0 means late)
@@ -219,8 +219,8 @@ FROM valid_orders;
 
 -- Average delivery time and average delay
 SELECT
-    ROUND(AVG(Delivery_Days), 2) AS Avg_Delivery_Days,
-    ROUND(AVG(Delay_Days), 2)    AS Avg_Delay_Days
+    ROUND(AVG(CASE WHEN Delay_Days > 0 THEN Delivery_Days END), 2) AS Avg_Delivery_Days,
+    ROUND(AVG(CASE WHEN Delay_Days > 0 THEN Delay_Days END), 2)    AS Avg_Delay_Days
 FROM valid_orders;
 
 -- Top 10 delayed routes
@@ -228,6 +228,7 @@ SELECT Route_ID,
        ROUND(AVG(Delay_Days), 2) AS Avg_Delay_Days,
        COUNT(*)                  AS Total_Orders
 FROM valid_orders
+WHERE Delay_Days > 0
 GROUP BY Route_ID
 ORDER BY Avg_Delay_Days DESC
 LIMIT 10;
@@ -241,7 +242,7 @@ SELECT Order_ID, Warehouse_ID, Route_ID, Delay_Days,
 FROM valid_orders;
 
 -- =========================================================
--- TASK 3 : ROUTE OPTIMIZATION
+-- TASK 3: ROUTE OPTIMIZATION
 -- =========================================================
 
 -- Average delivery time and traffic delay per route
@@ -284,7 +285,7 @@ ORDER BY Delay_Percentage DESC;
 -- prioritised for better scheduling, traffic avoidance, and route planning.
 
 -- =========================================================
--- TASK 4 : WAREHOUSE PERFORMANCE ANALYSIS
+-- TASK 4: WAREHOUSE PERFORMANCE ANALYSIS
 -- =========================================================
 -- "Processing time" is proxied by Delivery_Days (order date to delivery),
 -- because warehouse dispatch timestamps are not in the dataset.
@@ -336,7 +337,7 @@ SELECT Warehouse_ID,
 FROM Warehouse_OnTime;
 
 -- =========================================================
--- TASK 5 : DELIVERY AGENT PERFORMANCE
+-- TASK 5: DELIVERY AGENT PERFORMANCE
 -- =========================================================
 
 -- Rank agents within each route by on-time delivery percentage
@@ -386,7 +387,7 @@ FROM Ranked;
 -- training, balanced workloads, and better route allocation.
 
 -- =========================================================
--- TASK 6 : SHIPMENT TRACKING ANALYTICS
+-- TASK 6: SHIPMENT TRACKING ANALYTICS
 -- (requires data in the shipment_tracking table)
 -- =========================================================
 
@@ -399,7 +400,8 @@ LEFT JOIN shipment_tracking t ON o.Order_ID = t.Order_ID;
 SELECT Delay_Reason, COUNT(*) AS Total_Count
 FROM shipment_tracking
 WHERE Delay_Reason IS NOT NULL
-  AND Delay_Reason <> 'None'
+  AND TRIM(Delay_Reason) <> ''
+  AND UPPER(TRIM(Delay_Reason)) <> 'NONE'
 GROUP BY Delay_Reason
 ORDER BY Total_Count DESC;
 
@@ -410,7 +412,7 @@ WHERE Delayed_Checkpoints > 2
 ORDER BY Delayed_Checkpoints DESC;
 
 -- =========================================================
--- TASK 7 : FINAL BUSINESS INSIGHTS
+-- TASK 7: FINAL BUSINESS INSIGHTS
 -- (uses all de-duplicated orders)
 -- =========================================================
 
