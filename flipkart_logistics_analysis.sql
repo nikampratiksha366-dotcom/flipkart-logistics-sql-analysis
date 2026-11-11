@@ -7,21 +7,18 @@
 -- 2. Raw + cleaned staging separation
 -- 3. Data quality checks
 -- 4. Indexes for performance
--- 5. Transaction safety
--- 6. Reusable views and robust KPI logic
+-- 5. Reusable views and robust KPI logic
 -- =========================================================
 
 CREATE DATABASE IF NOT EXISTS flipkart_project;
 USE flipkart_project;
 
--- Needed for the UPDATE statements below (must run BEFORE them)
 SET SQL_SAFE_UPDATES = 0;
 
 -- =========================================================
 -- PREPARE RAW DATA TABLE
 -- =========================================================
 
--- Keep the original imported data untouched for repeatable analysis.
 CREATE TABLE IF NOT EXISTS orders_raw (
     Order_ID               VARCHAR(20),
     Customer_ID            VARCHAR(20),
@@ -37,8 +34,7 @@ CREATE TABLE IF NOT EXISTS orders_raw (
     Date_Flag              VARCHAR(20)
 );
 
--- If you are loading raw data from CSV, import it here into orders_raw.
--- Example (MySQL):
+-- Optional CSV import example:
 -- LOAD DATA INFILE '/path/to/flipkart_orders.csv'
 -- INTO TABLE orders_raw
 -- FIELDS TERMINATED BY ','
@@ -46,7 +42,6 @@ CREATE TABLE IF NOT EXISTS orders_raw (
 -- LINES TERMINATED BY '\n'
 -- IGNORE 1 LINES;
 
--- Create cleaned table from raw records.
 CREATE TABLE IF NOT EXISTS orders (
     Order_ID               VARCHAR(20),
     Customer_ID            VARCHAR(20),
@@ -62,8 +57,6 @@ CREATE TABLE IF NOT EXISTS orders (
     Date_Flag              VARCHAR(20)
 );
 
--- Task 6 needs shipment tracking data. These columns were NOT in the
--- orders table, so they live in a separate table (one row per order).
 CREATE TABLE IF NOT EXISTS shipment_tracking (
     Order_ID            VARCHAR(20),
     Last_Checkpoint     VARCHAR(100),
@@ -72,8 +65,7 @@ CREATE TABLE IF NOT EXISTS shipment_tracking (
     Delayed_Checkpoints INT
 );
 
--- Load your tracking data into this table before running Task 6.
--- Example (MySQL):
+-- Optional shipment tracking CSV import example:
 -- LOAD DATA INFILE '/path/to/shipment_tracking.csv'
 -- INTO TABLE shipment_tracking
 -- FIELDS TERMINATED BY ','
@@ -99,9 +91,8 @@ FROM orders_raw;
 -- TASK 1: DATA CLEANING
 -- =========================================================
 
-START TRANSACTION;
-
--- 1a. Remove duplicate Order_IDs, keeping only one row per Order_ID.
+-- MySQL DDL statements implicitly commit. The cleaning steps below are
+-- therefore intentionally not wrapped in a transaction.
 DROP TABLE IF EXISTS orders_dedup;
 CREATE TABLE orders_dedup AS
 SELECT Order_ID, Customer_ID, Warehouse_ID, Route_ID, Agent_ID,
@@ -120,9 +111,13 @@ WHERE rn = 1;
 DROP TABLE IF EXISTS orders;
 RENAME TABLE orders_dedup TO orders;
 
+-- A primary key requires Order_ID to be both unique and non-NULL.
+-- The preceding deduplication keeps one row for NULL IDs too, so remove
+-- those rows before creating the key.
+DELETE FROM orders WHERE Order_ID IS NULL;
 ALTER TABLE orders ADD PRIMARY KEY (Order_ID);
 
--- 1b. Fill missing Traffic_Delay_Min using route-wise average.
+-- Fill missing traffic delay using the route-wise average.
 UPDATE orders o
 JOIN (
     SELECT Route_ID,
@@ -134,24 +129,18 @@ JOIN (
 SET o.Traffic_Delay_Min = r.Avg_Delay
 WHERE o.Traffic_Delay_Min IS NULL;
 
--- Fallback for routes where all delays are NULL.
+-- Fallback for rows whose route has no known delay value.
 UPDATE orders
 SET Traffic_Delay_Min = (
-    SELECT avg_all
+    SELECT Avg_All_Delays
     FROM (
-        SELECT ROUND(AVG(Traffic_Delay_Min), 0) AS avg_all
+        SELECT ROUND(AVG(Traffic_Delay_Min), 0) AS Avg_All_Delays
         FROM orders
-    ) x
+    ) AS delay_average
 )
 WHERE Traffic_Delay_Min IS NULL;
 
--- 1c. Convert textual date formats if imported incorrectly.
--- Example conversion for raw files like '15-03-2024':
--- UPDATE orders SET Order_Date = STR_TO_DATE(Order_Date, '%d-%m-%Y');
--- UPDATE orders SET Expected_Delivery_Date = STR_TO_DATE(Expected_Delivery_Date, '%d-%m-%Y');
--- UPDATE orders SET Actual_Delivery_Date = STR_TO_DATE(Actual_Delivery_Date, '%d-%m-%Y');
-
--- 1d. Flag invalid dates.
+-- Flag missing or inconsistent dates.
 UPDATE orders
 SET Date_Flag = CASE
     WHEN Order_Date IS NULL
@@ -163,8 +152,6 @@ SET Date_Flag = CASE
     ELSE 'VALID'
 END;
 
-COMMIT;
-
 SELECT Date_Flag, COUNT(*) AS Total_Orders
 FROM orders
 GROUP BY Date_Flag;
@@ -173,18 +160,15 @@ GROUP BY Date_Flag;
 -- CREATE ANALYSIS VIEWS
 -- =========================================================
 
-DROP VIEW IF EXISTS valid_orders;
 CREATE OR REPLACE VIEW valid_orders AS
 SELECT
     o.*,
-    DATEDIFF(Actual_Delivery_Date, Order_Date)             AS Delivery_Days,
+    DATEDIFF(Actual_Delivery_Date, Order_Date) AS Delivery_Days,
     DATEDIFF(Actual_Delivery_Date, Expected_Delivery_Date) AS Delay_Days,
     CASE WHEN Actual_Delivery_Date > Expected_Delivery_Date THEN 1 ELSE 0 END AS Is_Delayed
-FROM orders o
+FROM orders AS o
 WHERE Date_Flag = 'VALID';
 
--- Additional reusable view for shipment tracking data.
-DROP VIEW IF EXISTS shipment_summary;
 CREATE OR REPLACE VIEW shipment_summary AS
 SELECT
     Order_ID,
@@ -196,72 +180,127 @@ SELECT
 FROM shipment_tracking;
 
 -- =========================================================
--- INDEXES FOR PERFORMANCE
+-- INDEXES FOR PERFORMANCE (MySQL-compatible, safe to rerun)
+-- MySQL does not support CREATE INDEX IF NOT EXISTS. These conditional
+-- statements check the index catalog before creating each index.
 -- =========================================================
 
-CREATE INDEX IF NOT EXISTS idx_orders_route_id ON orders(Route_ID);
-CREATE INDEX IF NOT EXISTS idx_orders_warehouse_id ON orders(Warehouse_ID);
-CREATE INDEX IF NOT EXISTS idx_orders_agent_id ON orders(Agent_ID);
-CREATE INDEX IF NOT EXISTS idx_orders_order_date ON orders(Order_Date);
-CREATE INDEX IF NOT EXISTS idx_orders_delivery_status ON orders(Delivery_Status);
-CREATE INDEX IF NOT EXISTS idx_tracking_order_id ON shipment_tracking(Order_ID);
-CREATE INDEX IF NOT EXISTS idx_tracking_delay_reason ON shipment_tracking(Delay_Reason);
+SET @create_index_sql = IF(
+    (SELECT COUNT(*) FROM information_schema.statistics
+     WHERE table_schema = DATABASE() AND table_name = 'orders' AND index_name = 'idx_orders_route_id') = 0,
+    'CREATE INDEX idx_orders_route_id ON orders(Route_ID)',
+    'SELECT 1'
+);
+PREPARE create_index_stmt FROM @create_index_sql;
+EXECUTE create_index_stmt;
+DEALLOCATE PREPARE create_index_stmt;
+
+SET @create_index_sql = IF(
+    (SELECT COUNT(*) FROM information_schema.statistics
+     WHERE table_schema = DATABASE() AND table_name = 'orders' AND index_name = 'idx_orders_warehouse_id') = 0,
+    'CREATE INDEX idx_orders_warehouse_id ON orders(Warehouse_ID)',
+    'SELECT 1'
+);
+PREPARE create_index_stmt FROM @create_index_sql;
+EXECUTE create_index_stmt;
+DEALLOCATE PREPARE create_index_stmt;
+
+SET @create_index_sql = IF(
+    (SELECT COUNT(*) FROM information_schema.statistics
+     WHERE table_schema = DATABASE() AND table_name = 'orders' AND index_name = 'idx_orders_agent_id') = 0,
+    'CREATE INDEX idx_orders_agent_id ON orders(Agent_ID)',
+    'SELECT 1'
+);
+PREPARE create_index_stmt FROM @create_index_sql;
+EXECUTE create_index_stmt;
+DEALLOCATE PREPARE create_index_stmt;
+
+SET @create_index_sql = IF(
+    (SELECT COUNT(*) FROM information_schema.statistics
+     WHERE table_schema = DATABASE() AND table_name = 'orders' AND index_name = 'idx_orders_order_date') = 0,
+    'CREATE INDEX idx_orders_order_date ON orders(Order_Date)',
+    'SELECT 1'
+);
+PREPARE create_index_stmt FROM @create_index_sql;
+EXECUTE create_index_stmt;
+DEALLOCATE PREPARE create_index_stmt;
+
+SET @create_index_sql = IF(
+    (SELECT COUNT(*) FROM information_schema.statistics
+     WHERE table_schema = DATABASE() AND table_name = 'orders' AND index_name = 'idx_orders_delivery_status') = 0,
+    'CREATE INDEX idx_orders_delivery_status ON orders(Delivery_Status)',
+    'SELECT 1'
+);
+PREPARE create_index_stmt FROM @create_index_sql;
+EXECUTE create_index_stmt;
+DEALLOCATE PREPARE create_index_stmt;
+
+SET @create_index_sql = IF(
+    (SELECT COUNT(*) FROM information_schema.statistics
+     WHERE table_schema = DATABASE() AND table_name = 'shipment_tracking' AND index_name = 'idx_tracking_order_id') = 0,
+    'CREATE INDEX idx_tracking_order_id ON shipment_tracking(Order_ID)',
+    'SELECT 1'
+);
+PREPARE create_index_stmt FROM @create_index_sql;
+EXECUTE create_index_stmt;
+DEALLOCATE PREPARE create_index_stmt;
+
+SET @create_index_sql = IF(
+    (SELECT COUNT(*) FROM information_schema.statistics
+     WHERE table_schema = DATABASE() AND table_name = 'shipment_tracking' AND index_name = 'idx_tracking_delay_reason') = 0,
+    'CREATE INDEX idx_tracking_delay_reason ON shipment_tracking(Delay_Reason)',
+    'SELECT 1'
+);
+PREPARE create_index_stmt FROM @create_index_sql;
+EXECUTE create_index_stmt;
+DEALLOCATE PREPARE create_index_stmt;
 
 -- =========================================================
 -- TASK 2: DELIVERY DELAY ANALYSIS
 -- =========================================================
 
--- Delay per order (Delay_Days > 0 means late)
 SELECT Order_ID, Warehouse_ID, Route_ID,
        Order_Date, Expected_Delivery_Date, Actual_Delivery_Date,
        Delivery_Days, Delay_Days
 FROM valid_orders;
 
--- Average delivery time and average delay
+-- Average delivery time and delay for late orders only.
 SELECT
     ROUND(AVG(CASE WHEN Delay_Days > 0 THEN Delivery_Days END), 2) AS Avg_Delivery_Days,
-    ROUND(AVG(CASE WHEN Delay_Days > 0 THEN Delay_Days END), 2)    AS Avg_Delay_Days
+    ROUND(AVG(CASE WHEN Delay_Days > 0 THEN Delay_Days END), 2) AS Avg_Delay_Days
 FROM valid_orders;
 
--- Top 10 delayed routes
+-- Top 10 delayed routes, based on late orders only.
 SELECT Route_ID,
        ROUND(AVG(Delay_Days), 2) AS Avg_Delay_Days,
-       COUNT(*)                  AS Total_Orders
+       COUNT(*) AS Total_Orders
 FROM valid_orders
 WHERE Delay_Days > 0
 GROUP BY Route_ID
 ORDER BY Avg_Delay_Days DESC
 LIMIT 10;
 
--- Rank orders by delay within each warehouse
 SELECT Order_ID, Warehouse_ID, Route_ID, Delay_Days,
-       RANK() OVER (
-           PARTITION BY Warehouse_ID
-           ORDER BY Delay_Days DESC
-       ) AS Delay_Rank
+       RANK() OVER (PARTITION BY Warehouse_ID ORDER BY Delay_Days DESC) AS Delay_Rank
 FROM valid_orders;
 
 -- =========================================================
 -- TASK 3: ROUTE OPTIMIZATION
 -- =========================================================
 
--- Average delivery time and traffic delay per route
 SELECT Route_ID,
-       ROUND(AVG(Delivery_Days), 2)     AS Avg_Delivery_Time_Days,
+       ROUND(AVG(Delivery_Days), 2) AS Avg_Delivery_Time_Days,
        ROUND(AVG(Traffic_Delay_Min), 2) AS Avg_Traffic_Delay_Min
 FROM valid_orders
 GROUP BY Route_ID;
 
--- Efficiency ratio.
--- PROXY: Distance_KM and Travel_Time_Min are not in the dataset, so
--- efficiency = average order value per day of delivery time.
+-- Efficiency proxy: average order value per delivery day.
 SELECT Route_ID,
        ROUND(AVG(Order_Value) / NULLIF(AVG(Delivery_Days), 0), 2) AS Efficiency_Ratio
 FROM valid_orders
 GROUP BY Route_ID
 ORDER BY Efficiency_Ratio DESC;
 
--- 3 worst-efficiency routes
 SELECT Route_ID,
        ROUND(AVG(Order_Value) / NULLIF(AVG(Delivery_Days), 0), 2) AS Efficiency_Ratio
 FROM valid_orders
@@ -270,27 +309,19 @@ HAVING AVG(Order_Value) / NULLIF(AVG(Delivery_Days), 0) IS NOT NULL
 ORDER BY Efficiency_Ratio ASC
 LIMIT 3;
 
--- Routes with more than 20% delayed shipments
 SELECT Route_ID,
-       COUNT(*)                        AS Total_Orders,
-       SUM(Is_Delayed)                 AS Delayed_Orders,
+       COUNT(*) AS Total_Orders,
+       SUM(Is_Delayed) AS Delayed_Orders,
        ROUND(AVG(Is_Delayed) * 100, 2) AS Delay_Percentage
 FROM valid_orders
 GROUP BY Route_ID
 HAVING ROUND(AVG(Is_Delayed) * 100, 2) > 20
 ORDER BY Delay_Percentage DESC;
 
--- RECOMMENDATION:
--- Routes with a high delay percentage and a low efficiency ratio should be
--- prioritised for better scheduling, traffic avoidance, and route planning.
-
 -- =========================================================
 -- TASK 4: WAREHOUSE PERFORMANCE ANALYSIS
 -- =========================================================
--- "Processing time" is proxied by Delivery_Days (order date to delivery),
--- because warehouse dispatch timestamps are not in the dataset.
 
--- Top 3 warehouses with highest average processing time
 SELECT Warehouse_ID,
        ROUND(AVG(Delivery_Days), 2) AS Avg_Processing_Time
 FROM valid_orders
@@ -298,15 +329,13 @@ GROUP BY Warehouse_ID
 ORDER BY Avg_Processing_Time DESC
 LIMIT 3;
 
--- Total vs delayed shipments per warehouse
 SELECT Warehouse_ID,
-       COUNT(*)                        AS Total_Shipments,
-       SUM(Is_Delayed)                 AS Delayed_Shipments,
+       COUNT(*) AS Total_Shipments,
+       SUM(Is_Delayed) AS Delayed_Shipments,
        ROUND(AVG(Is_Delayed) * 100, 2) AS Delayed_Percentage
 FROM valid_orders
 GROUP BY Warehouse_ID;
 
--- Bottleneck warehouses (CTE): processing time above the global average
 WITH Warehouse_Avg AS (
     SELECT Warehouse_ID, AVG(Delivery_Days) AS Avg_Processing_Time
     FROM valid_orders
@@ -318,13 +347,12 @@ Global_Avg AS (
 )
 SELECT w.Warehouse_ID,
        ROUND(w.Avg_Processing_Time, 2) AS Avg_Processing_Time,
-       ROUND(g.Global_Avg_Time, 2)     AS Global_Avg_Time
-FROM Warehouse_Avg w
-CROSS JOIN Global_Avg g
+       ROUND(g.Global_Avg_Time, 2) AS Global_Avg_Time
+FROM Warehouse_Avg AS w
+CROSS JOIN Global_Avg AS g
 WHERE w.Avg_Processing_Time > g.Global_Avg_Time
 ORDER BY w.Avg_Processing_Time DESC;
 
--- Rank warehouses by on-time delivery percentage
 WITH Warehouse_OnTime AS (
     SELECT Warehouse_ID,
            ROUND((1 - AVG(Is_Delayed)) * 100, 2) AS On_Time_Delivery_Percentage
@@ -340,7 +368,6 @@ FROM Warehouse_OnTime;
 -- TASK 5: DELIVERY AGENT PERFORMANCE
 -- =========================================================
 
--- Rank agents within each route by on-time delivery percentage
 WITH Agent_Route AS (
     SELECT Agent_ID, Route_ID,
            COUNT(*) AS Total_Orders,
@@ -349,14 +376,9 @@ WITH Agent_Route AS (
     GROUP BY Agent_ID, Route_ID
 )
 SELECT Agent_ID, Route_ID, Total_Orders, On_Time_Percentage,
-       RANK() OVER (
-           PARTITION BY Route_ID
-           ORDER BY On_Time_Percentage DESC
-       ) AS Agent_Rank
+       RANK() OVER (PARTITION BY Route_ID ORDER BY On_Time_Percentage DESC) AS Agent_Rank
 FROM Agent_Route;
 
--- Agents with on-time delivery percentage below 80%
--- (Total_Orders shown because small samples make percentages unreliable)
 SELECT Agent_ID, Route_ID,
        COUNT(*) AS Total_Orders,
        ROUND((1 - AVG(Is_Delayed)) * 100, 2) AS On_Time_Percentage
@@ -365,7 +387,6 @@ GROUP BY Agent_ID, Route_ID
 HAVING ROUND((1 - AVG(Is_Delayed)) * 100, 2) < 80
 ORDER BY On_Time_Percentage ASC;
 
--- Average delivery time: top 5 (fastest) vs bottom 5 (slowest) agents
 WITH Agent_Speed AS (
     SELECT Agent_ID, AVG(Delivery_Days) AS Avg_Delivery_Time
     FROM valid_orders
@@ -382,21 +403,14 @@ SELECT
     ROUND(AVG(CASE WHEN slowest_rank <= 5 THEN Avg_Delivery_Time END), 2) AS Bottom5_Avg_Delivery_Days
 FROM Ranked;
 
--- RECOMMENDATION:
--- Agents with low on-time delivery percentage should receive additional
--- training, balanced workloads, and better route allocation.
-
 -- =========================================================
 -- TASK 6: SHIPMENT TRACKING ANALYTICS
--- (requires data in the shipment_tracking table)
 -- =========================================================
 
--- Last checkpoint and checkpoint time for each order
 SELECT o.Order_ID, t.Last_Checkpoint, t.Checkpoint_Time
-FROM orders o
-LEFT JOIN shipment_tracking t ON o.Order_ID = t.Order_ID;
+FROM orders AS o
+LEFT JOIN shipment_tracking AS t ON o.Order_ID = t.Order_ID;
 
--- Most common delay reasons (excluding 'None')
 SELECT Delay_Reason, COUNT(*) AS Total_Count
 FROM shipment_tracking
 WHERE Delay_Reason IS NOT NULL
@@ -405,7 +419,6 @@ WHERE Delay_Reason IS NOT NULL
 GROUP BY Delay_Reason
 ORDER BY Total_Count DESC;
 
--- Orders with more than 2 delayed checkpoints
 SELECT Order_ID, Delayed_Checkpoints
 FROM shipment_tracking
 WHERE Delayed_Checkpoints > 2
@@ -413,35 +426,29 @@ ORDER BY Delayed_Checkpoints DESC;
 
 -- =========================================================
 -- TASK 7: FINAL BUSINESS INSIGHTS
--- (uses all de-duplicated orders)
 -- =========================================================
 
--- Total revenue
 SELECT SUM(Order_Value) AS Total_Revenue
 FROM orders;
 
--- Monthly order trend (year + month, so different years are not merged)
 SELECT DATE_FORMAT(Order_Date, '%Y-%m') AS Order_Month,
        COUNT(*) AS Total_Orders
 FROM orders
 GROUP BY DATE_FORMAT(Order_Date, '%Y-%m')
 ORDER BY Order_Month;
 
--- Monthly revenue trend
 SELECT DATE_FORMAT(Order_Date, '%Y-%m') AS Order_Month,
        SUM(Order_Value) AS Monthly_Revenue
 FROM orders
 GROUP BY DATE_FORMAT(Order_Date, '%Y-%m')
 ORDER BY Order_Month;
 
--- Highest revenue generating route
 SELECT Route_ID, SUM(Order_Value) AS Total_Revenue
 FROM orders
 GROUP BY Route_ID
 ORDER BY Total_Revenue DESC
 LIMIT 1;
 
--- Lowest revenue generating route
 SELECT Route_ID, SUM(Order_Value) AS Total_Revenue
 FROM orders
 GROUP BY Route_ID
