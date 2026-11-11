@@ -1,703 +1,338 @@
--- CREATE DATABASE
--- =========================================
+-- Flipkart logistics analysis (MySQL 8)
+-- Source tables are in flipkart_project (imported from CSV): flipkart_orders and
+-- flipkart_shipmenttracking. This script only reads them.
+-- Everything it creates goes into flipkart_project_v2, so it is safe to re-run.
 
-CREATE DATABASE flipkart_project;
-
-USE flipkart_project;
-
-DESC orders;
-
-SHOW TABLES;
-
-SELECT COUNT(*) FROM orders;
-
--- =========================================
--- CREATE TABLE
--- =========================================
-
-CREATE TABLE orders (
-    Order_ID VARCHAR(20),
-    Customer_ID VARCHAR(20),
-    Warehouse_ID VARCHAR(20),
-    Route_ID VARCHAR(20),
-    Agent_ID VARCHAR(20),
-    Order_Date DATE,
-    Expected_Delivery_Date DATE,
-    Actual_Delivery_Date DATE,
-    Traffic_Delay_Min INT,
-    Order_Value DECIMAL(10,2),
-    Delivery_Status VARCHAR(50),
-    Date_Flag VARCHAR(20)
-);
-
--- =========================================
--- CHECK TABLE
--- =========================================
-
-DESC orders;
-
--- =========================================
--- TASK 1 : DATA CLEANING
--- =========================================
-
--- Remove duplicate Order_ID records
-
-DELETE FROM orders
-WHERE Order_ID IN (
-    SELECT Order_ID
-    FROM (
-        SELECT 
-            Order_ID,
-            ROW_NUMBER() OVER (
-                PARTITION BY Order_ID
-                ORDER BY Order_ID
-            ) AS rn
-        FROM orders
-    ) t
-    WHERE rn > 1
-);
-SELECT * FROM orders;
-
--- Replace NULL Traffic_Delay_Min values
-
-UPDATE orders o
-JOIN (
-    SELECT 
-        Route_ID,
-        AVG(Traffic_Delay_Min) AS Avg_Delay
-    FROM orders
-    WHERE Traffic_Delay_Min IS NOT NULL
-    GROUP BY Route_ID
-) r
-ON o.Route_ID = r.Route_ID
-
-SET o.Traffic_Delay_Min = r.Avg_Delay
-
-WHERE o.Traffic_Delay_Min IS NULL;
-
+CREATE DATABASE IF NOT EXISTS flipkart_project_v2;
+USE flipkart_project_v2;
 
 SET SQL_SAFE_UPDATES = 0;
 
-#Convert all date columns into YYYY-MM-DD format using SQL functions.#
+-- a date that cannot be read becomes NULL (and is flagged below) instead of stopping the script
+SET SESSION sql_mode = REPLACE(REPLACE(@@sql_mode, 'STRICT_TRANS_TABLES', ''), 'STRICT_ALL_TABLES', '');
 
-SELECT 
-    DATE_FORMAT(Order_Date, '%Y-%m-%d') AS Formatted_Order_Date,
-    DATE_FORMAT(Expected_Delivery_Date, '%Y-%m-%d') AS Formatted_Expected_Date,
-    DATE_FORMAT(Actual_Delivery_Date, '%Y-%m-%d') AS Formatted_Actual_Date
-FROM orders;
+-- check the source data first
+SELECT COUNT(*) AS source_orders, COUNT(DISTINCT Order_ID) AS distinct_order_ids
+FROM flipkart_project.flipkart_orders;
 
--- Flag invalid dates
+SELECT Status, COUNT(*) AS total
+FROM flipkart_project.flipkart_orders
+GROUP BY Status;
 
+-- Task 1: cleaning
+
+-- dates are stored as text in the source, so convert them here
+-- handles yyyy-mm-dd, dd-mm-yyyy and dd/mm/yyyy (day first). Anything else becomes NULL.
+-- one row per Order_ID (if an id is repeated, keep the earliest order date)
+DROP VIEW IF EXISTS valid_orders;
+DROP TABLE IF EXISTS orders;
+
+CREATE TABLE orders (
+    Order_ID               VARCHAR(20) PRIMARY KEY,
+    Warehouse_ID           VARCHAR(20),
+    Route_ID               VARCHAR(20),
+    Agent_ID               VARCHAR(20),
+    Order_Date             DATE,
+    Expected_Delivery_Date DATE,
+    Actual_Delivery_Date   DATE,
+    Delivery_Status        VARCHAR(50),
+    Order_Value            DECIMAL(12,2),
+    Date_Flag              VARCHAR(20),
+    KEY idx_route (Route_ID),
+    KEY idx_warehouse (Warehouse_ID),
+    KEY idx_agent (Agent_ID),
+    KEY idx_order_date (Order_Date)
+);
+
+INSERT INTO orders
+SELECT Order_ID, Warehouse_ID, Route_ID, Agent_ID,
+       Order_Date, Expected_Delivery_Date, Actual_Delivery_Date,
+       Status, Order_Value, NULL
+FROM (
+    SELECT TRIM(Order_ID) AS Order_ID,
+           Warehouse_ID, Route_ID, Agent_ID,
+           CASE WHEN TRIM(Order_Date) REGEXP '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' THEN STR_TO_DATE(TRIM(Order_Date), '%Y-%m-%d')
+                WHEN TRIM(Order_Date) REGEXP '^[0-9]{2}-[0-9]{2}-[0-9]{4}$' THEN STR_TO_DATE(TRIM(Order_Date), '%d-%m-%Y')
+                WHEN TRIM(Order_Date) REGEXP '^[0-9]{2}/[0-9]{2}/[0-9]{4}$' THEN STR_TO_DATE(TRIM(Order_Date), '%d/%m/%Y')
+                ELSE NULL END AS Order_Date,
+           CASE WHEN TRIM(Expected_Delivery_Date) REGEXP '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' THEN STR_TO_DATE(TRIM(Expected_Delivery_Date), '%Y-%m-%d')
+                WHEN TRIM(Expected_Delivery_Date) REGEXP '^[0-9]{2}-[0-9]{2}-[0-9]{4}$' THEN STR_TO_DATE(TRIM(Expected_Delivery_Date), '%d-%m-%Y')
+                WHEN TRIM(Expected_Delivery_Date) REGEXP '^[0-9]{2}/[0-9]{2}/[0-9]{4}$' THEN STR_TO_DATE(TRIM(Expected_Delivery_Date), '%d/%m/%Y')
+                ELSE NULL END AS Expected_Delivery_Date,
+           CASE WHEN TRIM(Actual_Delivery_Date) REGEXP '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' THEN STR_TO_DATE(TRIM(Actual_Delivery_Date), '%Y-%m-%d')
+                WHEN TRIM(Actual_Delivery_Date) REGEXP '^[0-9]{2}-[0-9]{2}-[0-9]{4}$' THEN STR_TO_DATE(TRIM(Actual_Delivery_Date), '%d-%m-%Y')
+                WHEN TRIM(Actual_Delivery_Date) REGEXP '^[0-9]{2}/[0-9]{2}/[0-9]{4}$' THEN STR_TO_DATE(TRIM(Actual_Delivery_Date), '%d/%m/%Y')
+                ELSE NULL END AS Actual_Delivery_Date,
+           Status, Order_Value,
+           ROW_NUMBER() OVER (PARTITION BY TRIM(Order_ID) ORDER BY Order_Date) AS rn
+    FROM flipkart_project.flipkart_orders
+    WHERE Order_ID IS NOT NULL AND TRIM(Order_ID) <> ''
+) t
+WHERE rn = 1;
+
+-- mark rows with a missing date or a delivery before the order
 UPDATE orders
-SET Date_Flag = 'INVALID'
-WHERE Actual_Delivery_Date < Order_Date;
+SET Date_Flag = CASE
+    WHEN Order_Date IS NULL
+      OR Expected_Delivery_Date IS NULL
+      OR Actual_Delivery_Date IS NULL
+      OR Actual_Delivery_Date < Order_Date
+      OR Expected_Delivery_Date < Order_Date
+    THEN 'INVALID'
+    ELSE 'VALID'
+END;
 
-UPDATE orders
-SET Date_Flag = 'VALID'
-WHERE Actual_Delivery_Date >= Order_Date;
-
-
--- =========================================
--- TASK 2 : DELIVERY DELAY ANALYSIS
--- =========================================
--- Calculate delivery delay
-SELECT 
-    Order_ID,
-    Warehouse_ID,
-    Route_ID,
-    Order_Date,
-    Actual_Delivery_Date,
-    DATEDIFF(Actual_Delivery_Date, Order_Date) AS Delay_Days
-FROM orders;
-
-
--- Average delivery delay
-
-SELECT 
-    AVG(DATEDIFF(Actual_Delivery_Date, Order_Date)) 
-    AS Avg_Delivery_Delay
-FROM orders;
-
--- Top 10 delayed routes
-
-SELECT 
-    Route_ID,
-    AVG(DATEDIFF(Actual_Delivery_Date, Order_Date)) 
-    AS Avg_Delay
+SELECT Date_Flag, COUNT(*) AS total_orders
 FROM orders
+GROUP BY Date_Flag;
+
+-- tracking table with a proper datetime column
+DROP TABLE IF EXISTS shipment_tracking;
+
+CREATE TABLE shipment_tracking (
+    Tracking_ID     VARCHAR(20),
+    Order_ID        VARCHAR(20),
+    Checkpoint      VARCHAR(100),
+    Checkpoint_Time DATETIME,
+    Delay_Reason    VARCHAR(100),
+    Delay_Minutes   INT,
+    KEY idx_tracking_order (Order_ID)
+);
+
+INSERT INTO shipment_tracking
+SELECT Tracking_ID, TRIM(Order_ID), Checkpoint,
+       CASE WHEN TRIM(Checkpoint_Time) REGEXP '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}$'
+            THEN STR_TO_DATE(TRIM(Checkpoint_Time), '%Y-%m-%d %H:%i:%s') ELSE NULL END,
+       Delay_Reason, Delay_Minutes
+FROM flipkart_project.flipkart_shipmenttracking;
+
+-- views used below
+
+CREATE OR REPLACE VIEW valid_orders AS
+SELECT o.*,
+       DATEDIFF(Actual_Delivery_Date, Order_Date) AS Delivery_Days,
+       DATEDIFF(Actual_Delivery_Date, Expected_Delivery_Date) AS Delay_Days,
+       CASE WHEN Actual_Delivery_Date > Expected_Delivery_Date THEN 1 ELSE 0 END AS Is_Delayed
+FROM orders AS o
+WHERE Date_Flag = 'VALID';
+
+-- one row per order: latest checkpoint and how many checkpoints were delayed
+CREATE OR REPLACE VIEW shipment_summary AS
+SELECT Order_ID,
+       MAX(CASE WHEN rn = 1 THEN Checkpoint END) AS Last_Checkpoint,
+       MAX(CASE WHEN rn = 1 THEN Checkpoint_Time END) AS Checkpoint_Time,
+       SUM(CASE WHEN Delay_Minutes > 0 THEN 1 ELSE 0 END) AS Delayed_Checkpoints,
+       SUM(COALESCE(Delay_Minutes, 0)) AS Total_Delay_Min
+FROM (
+    SELECT t.*,
+           ROW_NUMBER() OVER (PARTITION BY Order_ID ORDER BY Checkpoint_Time DESC) AS rn
+    FROM shipment_tracking t
+) x
+GROUP BY Order_ID;
+
+-- Task 2: delivery delays
+
+SELECT Order_ID, Warehouse_ID, Route_ID,
+       Order_Date, Expected_Delivery_Date, Actual_Delivery_Date,
+       Delivery_Days, Delay_Days
+FROM valid_orders;
+
+-- average for late orders only
+SELECT ROUND(AVG(CASE WHEN Delay_Days > 0 THEN Delivery_Days END), 2) AS Avg_Delivery_Days,
+       ROUND(AVG(CASE WHEN Delay_Days > 0 THEN Delay_Days END), 2) AS Avg_Delay_Days
+FROM valid_orders;
+
+-- top 10 routes by delay (late orders only)
+SELECT Route_ID,
+       ROUND(AVG(Delay_Days), 2) AS Avg_Delay_Days,
+       COUNT(*) AS Late_Orders
+FROM valid_orders
+WHERE Delay_Days > 0
 GROUP BY Route_ID
-ORDER BY Avg_Delay DESC
+ORDER BY Avg_Delay_Days DESC
 LIMIT 10;
 
--- Rank orders within each warehouse
+SELECT Order_ID, Warehouse_ID, Route_ID, Delay_Days,
+       RANK() OVER (PARTITION BY Warehouse_ID ORDER BY Delay_Days DESC) AS Delay_Rank
+FROM valid_orders;
 
-SELECT 
-    Order_ID,
-    Warehouse_ID,
-    Route_ID,
-    DATEDIFF(Actual_Delivery_Date, Order_Date) 
-    AS Delay_Days,
+-- Task 3: routes
 
-    RANK() OVER (
-        PARTITION BY Warehouse_ID
-        ORDER BY DATEDIFF(
-            Actual_Delivery_Date,
-            Order_Date
-        ) DESC
-    ) AS Delay_Rank
+-- tracking delay comes from the shipment_tracking table (Delay_Minutes)
+SELECT v.Route_ID,
+       ROUND(AVG(v.Delivery_Days), 2) AS Avg_Delivery_Days,
+       ROUND(AVG(s.Total_Delay_Min), 2) AS Avg_Tracking_Delay_Min
+FROM valid_orders v
+LEFT JOIN shipment_summary s ON v.Order_ID = s.Order_ID
+GROUP BY v.Route_ID;
 
-FROM orders;
-
--- =========================================
--- TASK 3 : ROUTE OPTIMIZATION
--- =========================================
--- Average delivery time and traffic delay
-
-SELECT 
-    Route_ID,
-
-    AVG(
-        DATEDIFF(
-            Actual_Delivery_Date,
-            Order_Date
-        )
-    ) AS Avg_Delivery_Time_Days,
-
-    AVG(Traffic_Delay_Min)
-    AS Avg_Traffic_Delay_Min
-
-FROM orders
-GROUP BY Route_ID;
-
--- Efficiency ratio
--- (Proxy method because Distance_KM
--- and Travel_Time_Min were not available)
-
-SELECT 
-    Route_ID,
-
-    AVG(Order_Value) /
-    AVG(
-        DATEDIFF(
-            Actual_Delivery_Date,
-            Order_Date
-        )
-    ) AS Efficiency_Ratio
-
-FROM orders
-GROUP BY Route_ID;
-
--- 3 worst efficiency routes
-
-SELECT 
-    Route_ID,
-
-    AVG(Order_Value) /
-    AVG(
-        DATEDIFF(
-            Actual_Delivery_Date,
-            Order_Date
-        )
-    ) AS Efficiency_Ratio
-
-FROM orders
+-- no distance data, so efficiency = avg order value / avg delivery days
+SELECT Route_ID,
+       ROUND(AVG(Order_Value) / NULLIF(AVG(Delivery_Days), 0), 2) AS Efficiency_Ratio
+FROM valid_orders
 GROUP BY Route_ID
+ORDER BY Efficiency_Ratio DESC;
+
+-- 3 least efficient routes
+SELECT Route_ID,
+       ROUND(AVG(Order_Value) / NULLIF(AVG(Delivery_Days), 0), 2) AS Efficiency_Ratio
+FROM valid_orders
+GROUP BY Route_ID
+HAVING AVG(Order_Value) / NULLIF(AVG(Delivery_Days), 0) IS NOT NULL
 ORDER BY Efficiency_Ratio ASC
 LIMIT 3;
 
--- Routes with more than 20% delayed shipments
-SELECT 
-    Route_ID,
-
-    COUNT(*) AS Total_Orders,
-
-    SUM(
-        CASE
-            WHEN Actual_Delivery_Date >
-                 Expected_Delivery_Date
-            THEN 1
-            ELSE 0
-        END
-    ) AS Delayed_Orders,
-
-    (
-        SUM(
-            CASE
-                WHEN Actual_Delivery_Date >
-                     Expected_Delivery_Date
-                THEN 1
-                ELSE 0
-            END
-        ) * 100.0 / COUNT(*)
-    ) AS Delay_Percentage
-
-FROM orders
-
+-- routes with more than 20% late orders
+SELECT Route_ID,
+       COUNT(*) AS Total_Orders,
+       SUM(Is_Delayed) AS Delayed_Orders,
+       ROUND(AVG(Is_Delayed) * 100, 2) AS Delay_Percentage
+FROM valid_orders
 GROUP BY Route_ID
+HAVING AVG(Is_Delayed) * 100 > 20
+ORDER BY Delay_Percentage DESC;
 
-HAVING (
-    SUM(
-        CASE
-            WHEN Actual_Delivery_Date >
-                 Expected_Delivery_Date
-            THEN 1
-            ELSE 0
-        END
-    ) * 100.0 / COUNT(*)
-) > 20;
+-- Task 4: warehouses
 
-
--- RECOMMENDATION:
--- Routes with high delay percentage and
--- low efficiency ratio should be optimized
--- using better scheduling, traffic reduction,
--- and route planning strategies.
-
--- =========================================
--- TASK 4 : WAREHOUSE PERFORMANCE ANALYSIS
-
--- Top 3 warehouses with highest average processing time
-
-SELECT 
-    Warehouse_ID,
-
-    AVG(
-        DATEDIFF(
-            Actual_Delivery_Date,
-            Order_Date
-        )
-    ) AS Avg_Processing_Time
-
-FROM orders
-
+-- 3 warehouses with the longest average delivery time
+SELECT Warehouse_ID,
+       ROUND(AVG(Delivery_Days), 2) AS Avg_Delivery_Days
+FROM valid_orders
 GROUP BY Warehouse_ID
-
-ORDER BY Avg_Processing_Time DESC
-
+ORDER BY Avg_Delivery_Days DESC
 LIMIT 3;
 
--- =========================================
-
--- Total vs delayed shipments for each warehouse
-
-SELECT 
-    Warehouse_ID,
-
-    COUNT(*) AS Total_Shipments,
-
-    SUM(
-        CASE
-            WHEN Actual_Delivery_Date >
-                 Expected_Delivery_Date
-            THEN 1
-            ELSE 0
-        END
-    ) AS Delayed_Shipments
-
-FROM orders
-
+SELECT Warehouse_ID,
+       COUNT(*) AS Total_Shipments,
+       SUM(Is_Delayed) AS Delayed_Shipments,
+       ROUND(AVG(Is_Delayed) * 100, 2) AS Delayed_Percentage
+FROM valid_orders
 GROUP BY Warehouse_ID;
 
--- =========================================
-
--- Bottleneck warehouses using CTE
--- Processing time > global average
-
+-- warehouses slower than the overall average
 WITH Warehouse_Avg AS (
-
-    SELECT 
-        Warehouse_ID,
-
-        AVG(
-            DATEDIFF(
-                Actual_Delivery_Date,
-                Order_Date
-            )
-        ) AS Avg_Processing_Time
-
-    FROM orders
-
-    GROUP BY Warehouse_ID
-),
-
-Global_Avg AS (
-
-    SELECT 
-        AVG(
-            DATEDIFF(
-                Actual_Delivery_Date,
-                Order_Date
-            )
-        ) AS Global_Avg_Time
-
-    FROM orders
-)
-
-SELECT 
-    w.Warehouse_ID,
-    w.Avg_Processing_Time
-
-FROM Warehouse_Avg w
-JOIN Global_Avg g
-
-ON w.Avg_Processing_Time >
-   g.Global_Avg_Time;
-
--- =========================================
-
--- Rank warehouses by on-time delivery percentage
-
--- Top 3 warehouses with highest average processing time
-
-SELECT 
-    Warehouse_ID,
-
-    AVG(
-        DATEDIFF(
-            Actual_Delivery_Date,
-            Order_Date
-        )
-    ) AS Avg_Processing_Time
-
-FROM orders
-
-GROUP BY Warehouse_ID
-
-ORDER BY Avg_Processing_Time DESC
-
-LIMIT 3;
-
--- Total vs delayed shipments for each warehouse
-
-SELECT 
-    Warehouse_ID,
-
-    COUNT(*) AS Total_Shipments,
-
-    SUM(
-        CASE
-            WHEN Actual_Delivery_Date >
-                 Expected_Delivery_Date
-            THEN 1
-            ELSE 0
-        END
-    ) AS Delayed_Shipments
-
-FROM orders
-
-GROUP BY Warehouse_ID;
-
--- Bottleneck warehouses using CTE
--- Processing time > global average
-
-WITH Warehouse_Avg AS (
-
-    SELECT 
-        Warehouse_ID,
-
-        AVG(
-            DATEDIFF(
-                Actual_Delivery_Date,
-                Order_Date
-            )
-        ) AS Avg_Processing_Time
-
-    FROM orders
-
+    SELECT Warehouse_ID, AVG(Delivery_Days) AS Avg_Days
+    FROM valid_orders
     GROUP BY Warehouse_ID
 ),
 Global_Avg AS (
-
-    SELECT 
-        AVG(
-            DATEDIFF(
-                Actual_Delivery_Date,
-                Order_Date
-            )
-        ) AS Global_Avg_Time
-
-    FROM orders
+    SELECT AVG(Delivery_Days) AS Global_Days
+    FROM valid_orders
 )
-
-SELECT 
-    w.Warehouse_ID,
-    w.Avg_Processing_Time
-
+SELECT w.Warehouse_ID,
+       ROUND(w.Avg_Days, 2) AS Avg_Days,
+       ROUND(g.Global_Days, 2) AS Overall_Avg_Days
 FROM Warehouse_Avg w
-JOIN Global_Avg g
-ON w.Avg_Processing_Time >
-   g.Global_Avg_Time;
+CROSS JOIN Global_Avg g
+WHERE w.Avg_Days > g.Global_Days
+ORDER BY w.Avg_Days DESC;
 
--- =========================================
--- Rank warehouses by on-time delivery percentage
+-- warehouse ranking by on-time %
+WITH Warehouse_OnTime AS (
+    SELECT Warehouse_ID,
+           ROUND((1 - AVG(Is_Delayed)) * 100, 2) AS On_Time_Percentage
+    FROM valid_orders
+    GROUP BY Warehouse_ID
+)
+SELECT Warehouse_ID, On_Time_Percentage,
+       RANK() OVER (ORDER BY On_Time_Percentage DESC) AS Warehouse_Rank
+FROM Warehouse_OnTime;
 
-SELECT 
-    Warehouse_ID,
+-- Task 5: agents
 
-    (
-        SUM(
-            CASE
-                WHEN Actual_Delivery_Date <=
-                     Expected_Delivery_Date
-                THEN 1
-                ELSE 0
-            END
-        ) * 100.0 / COUNT(*)
-    ) AS On_Time_Delivery_Percentage,
+WITH Agent_Route AS (
+    SELECT Agent_ID, Route_ID,
+           COUNT(*) AS Total_Orders,
+           ROUND((1 - AVG(Is_Delayed)) * 100, 2) AS On_Time_Percentage
+    FROM valid_orders
+    GROUP BY Agent_ID, Route_ID
+)
+SELECT Agent_ID, Route_ID, Total_Orders, On_Time_Percentage,
+       RANK() OVER (PARTITION BY Route_ID ORDER BY On_Time_Percentage DESC) AS Agent_Rank
+FROM Agent_Route;
 
-    RANK() OVER (
-        ORDER BY
-        (
-            SUM(
-                CASE
-                    WHEN Actual_Delivery_Date <=
-                         Expected_Delivery_Date
-                    THEN 1
-                     ELSE 0
-                END
-            ) * 100.0 / COUNT(*)
-        ) DESC
-    ) AS Warehouse_Rank
-
-FROM orders
-
-GROUP BY Warehouse_ID;
-
--- =========================================
-
--- TASK 5 : DELIVERY AGENT PERFORMANCE
--- =========================================
-
--- Rank agents (per route)
--- by on-time delivery percentage
-
-SELECT 
-    Agent_ID,
-    Route_ID,
-
-    (
-        SUM(
-            CASE
-                WHEN Actual_Delivery_Date <=
-                     Expected_Delivery_Date
-                THEN 1
-                ELSE 0
-            END
-        ) * 100.0 / COUNT(*)
-    ) AS On_Time_Percentage,
-    RANK() OVER (
-        PARTITION BY Route_ID
-        ORDER BY
-        (
-            SUM(
-                CASE
-                    WHEN Actual_Delivery_Date <=
-                         Expected_Delivery_Date
-                    THEN 1
-                    ELSE 0
-                END
-            ) * 100.0 / COUNT(*)
-        ) DESC
-    ) AS Agent_Rank
-
-FROM orders
-GROUP BY Agent_ID, Route_ID;
-
--- =========================================
-
--- Agents with on-time delivery percentage < 80%
-
-SELECT 
-    Agent_ID,
-    Route_ID,
-
-    (
-        SUM(
-            CASE
-                WHEN Actual_Delivery_Date <=
-                     Expected_Delivery_Date
-                THEN 1
-                ELSE 0
-            END
-             ) * 100.0 / COUNT(*)
-    ) AS On_Time_Percentage
-
-FROM orders
-
+-- agents below 80% on-time
+SELECT Agent_ID, Route_ID,
+       COUNT(*) AS Total_Orders,
+       ROUND((1 - AVG(Is_Delayed)) * 100, 2) AS On_Time_Percentage
+FROM valid_orders
 GROUP BY Agent_ID, Route_ID
+HAVING (1 - AVG(Is_Delayed)) * 100 < 80
+ORDER BY On_Time_Percentage ASC;
 
-HAVING On_Time_Percentage < 80;
-
--- =========================================
-
--- Compare average speed of
--- top 5 vs bottom 5 agents
-
--- Top 5 agents
-
-SELECT 
-    AVG(Avg_Delivery_Time)
-    AS Top5_Avg_Speed
-    FROM (
-
-    SELECT 
-        Agent_ID,
-
-        AVG(
-            DATEDIFF(
-                Actual_Delivery_Date,
-                Order_Date
-            )
-        ) AS Avg_Delivery_Time
-
-    FROM orders
-
+-- average delivery time: 5 fastest agents vs 5 slowest
+WITH Agent_Speed AS (
+    SELECT Agent_ID, AVG(Delivery_Days) AS Avg_Delivery_Days
+    FROM valid_orders
     GROUP BY Agent_ID
+),
+Ranked AS (
+    SELECT Agent_ID, Avg_Delivery_Days,
+           ROW_NUMBER() OVER (ORDER BY Avg_Delivery_Days ASC, Agent_ID) AS fastest_rank,
+           ROW_NUMBER() OVER (ORDER BY Avg_Delivery_Days DESC, Agent_ID) AS slowest_rank
+    FROM Agent_Speed
+)
+SELECT ROUND(AVG(CASE WHEN fastest_rank <= 5 THEN Avg_Delivery_Days END), 2) AS Top5_Avg_Days,
+       ROUND(AVG(CASE WHEN slowest_rank <= 5 THEN Avg_Delivery_Days END), 2) AS Bottom5_Avg_Days
+FROM Ranked;
 
-    ORDER BY Avg_Delivery_Time ASC
+-- Task 6: shipment tracking
 
-    LIMIT 5
+-- last checkpoint for every order
+SELECT o.Order_ID, s.Last_Checkpoint, s.Checkpoint_Time
+FROM orders o
+LEFT JOIN shipment_summary s ON o.Order_ID = s.Order_ID;
 
-) top_agents;
--- =========================================
-
--- Bottom 5 agents
-
-SELECT 
-    AVG(Avg_Delivery_Time)
-    AS Bottom5_Avg_Speed
-
-FROM (
-
-    SELECT 
-        Agent_ID,
-
-        AVG(
-            DATEDIFF(
-                Actual_Delivery_Date,
-                Order_Date
-            )
-        ) AS Avg_Delivery_Time
-
-    FROM orders
-    GROUP BY Agent_ID
-
-    ORDER BY Avg_Delivery_Time DESC
-
-    LIMIT 5
-
-) bottom_agents;
-
--- =========================================
-
--- RECOMMENDATION:
--- Agents with low on-time delivery percentage
--- should receive additional training,
--- optimized workloads, and better route
--- allocation to improve delivery efficiency.
-
-DESC orders;
--- =========================================
-
--- TASK 6 : SHIPMENT TRACKING ANALYTICS
-
--- List last checkpoint and checkpoint time
--- for each order
-
-SELECT 
-    Order_ID,
-    Last_Checkpoint,
-    Checkpoint_Time
-
-FROM orders;
--- =========================================
-
--- Most common delay reasons
--- excluding 'None'
-
-SELECT 
-    Delay_Reason,
-    COUNT(*) AS Total_Count
-
-FROM orders
-
+-- most common delay reasons (ignoring 'None')
+SELECT Delay_Reason, COUNT(*) AS Total_Count, SUM(Delay_Minutes) AS Total_Delay_Min
+FROM shipment_tracking
 WHERE Delay_Reason IS NOT NULL
-AND Delay_Reason <> 'None'
-
+  AND TRIM(Delay_Reason) <> ''
+  AND UPPER(TRIM(Delay_Reason)) <> 'NONE'
 GROUP BY Delay_Reason
-
 ORDER BY Total_Count DESC;
--- =========================================
 
--- Orders with more than
--- 2 delayed checkpoints
+-- orders with more than 2 delayed checkpoints
+SELECT Order_ID, Delayed_Checkpoints, Total_Delay_Min
+FROM shipment_summary
+WHERE Delayed_Checkpoints > 2
+ORDER BY Delayed_Checkpoints DESC;
 
-SELECT 
-    Order_ID,
-    Delayed_Checkpoints
+-- Task 7: revenue and trends
 
-FROM orders
-
-WHERE Delayed_Checkpoints > 2;
-
--- =========================================
--- TASK 7 : FINAL BUSINESS INSIGHTS
--- =========================================
-
--- Total revenue generated
-
-SELECT 
-    SUM(Order_Value)
-    AS Total_Revenue
-
+SELECT SUM(Order_Value) AS Total_Revenue
 FROM orders;
 
--- Monthly order trend
-
-SELECT 
-    MONTH(Order_Date) AS Month_No,
-
-    COUNT(*) AS Total_Orders
-
+SELECT DATE_FORMAT(Order_Date, '%Y-%m') AS Order_Month,
+       COUNT(*) AS Total_Orders
 FROM orders
-GROUP BY MONTH(Order_Date)
-ORDER BY Month_No;
+GROUP BY DATE_FORMAT(Order_Date, '%Y-%m')
+ORDER BY Order_Month;
 
--- Monthly revenue trend
-
-SELECT 
-    MONTH(Order_Date) AS Month_No,
-
-    SUM(Order_Value)
-    AS Monthly_Revenue
-
+SELECT DATE_FORMAT(Order_Date, '%Y-%m') AS Order_Month,
+       SUM(Order_Value) AS Monthly_Revenue
 FROM orders
-GROUP BY MONTH(Order_Date)
-ORDER BY Month_No;
+GROUP BY DATE_FORMAT(Order_Date, '%Y-%m')
+ORDER BY Order_Month;
 
--- Highest revenue generating route
-
-SELECT 
-    Route_ID,
-
-    SUM(Order_Value)
-    AS Total_Revenue
-
+-- best and worst route by revenue
+SELECT Route_ID, SUM(Order_Value) AS Total_Revenue
 FROM orders
 GROUP BY Route_ID
 ORDER BY Total_Revenue DESC
 LIMIT 1;
 
--- Lowest revenue generating route
-
-SELECT 
-    Route_ID,
-
-    SUM(Order_Value)
-    AS Total_Revenue
-
+SELECT Route_ID, SUM(Order_Value) AS Total_Revenue
 FROM orders
 GROUP BY Route_ID
 ORDER BY Total_Revenue ASC
 LIMIT 1;
 
+-- overall summary
+SELECT COUNT(*) AS Total_Orders,
+       SUM(CASE WHEN Date_Flag = 'VALID' THEN 1 ELSE 0 END) AS Valid_Orders,
+       SUM(CASE WHEN Date_Flag = 'INVALID' THEN 1 ELSE 0 END) AS Invalid_Orders,
+       ROUND(AVG(CASE WHEN Date_Flag = 'VALID' THEN DATEDIFF(Actual_Delivery_Date, Order_Date) END), 2) AS Avg_Delivery_Days,
+       ROUND(SUM(CASE WHEN Actual_Delivery_Date > Expected_Delivery_Date THEN Order_Value ELSE 0 END), 2) AS Late_Delivery_Revenue,
+       ROUND(SUM(Order_Value), 2) AS Total_Revenue
+FROM orders;
